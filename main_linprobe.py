@@ -25,7 +25,7 @@ import torchvision.datasets as datasets
 
 import timm
 
-assert timm.__version__ == "0.3.2" # version check
+#assert timm.__version__ == "0.3.2" # version check
 from timm.models.layers import trunc_normal_
 
 import util.misc as misc
@@ -33,6 +33,14 @@ from util.pos_embed import interpolate_pos_embed
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from util.lars import LARS
 from util.crop import RandomResizedCrop
+
+try:
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.xla_multiprocessing as xmp
+    import torch_xla.distributed.parallel_loader as pl
+    import torch_xla.utils.utils as xu
+except ImportError:
+    xm = xmp = pl = xu = None
 
 import models_vit
 
@@ -110,6 +118,11 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
 
+    # TPU parameters
+    parser.add_argument('--use_xla', action='store_true',
+                        help='Use PyTorch XLA on TPUs')
+    parser.set_defaults(use_xla=False)
+
     return parser
 
 
@@ -119,7 +132,11 @@ def main(args):
     print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
     print("{}".format(args).replace(', ', ',\n'))
 
-    device = torch.device(args.device)
+    if misc.XLA_CFG["is_xla"]:
+        device = xm.xla_device()
+    else:
+        device = torch.device(args.device)
+
 
     # fix the seed for reproducibility
     seed = args.seed + misc.get_rank()
@@ -150,7 +167,6 @@ def main(args):
         sampler_train = torch.utils.data.DistributedSampler(
             dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
         )
-        print("Sampler_train = %s" % str(sampler_train))
         if args.dist_eval:
             if len(dataset_val) % num_tasks != 0:
                 print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
@@ -158,12 +174,16 @@ def main(args):
                       'equal num of samples per-process.')
             sampler_val = torch.utils.data.DistributedSampler(
                 dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=True)  # shuffle=True to reduce monitor bias
+            print("Cheval**************")
         else:
             sampler_val = torch.utils.data.SequentialSampler(dataset_val)
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
+    # disable log writter due to weird error
+    if args.log_dir.strip() == "None":
+        args.log_dir = None
     if global_rank == 0 and args.log_dir is not None and not args.eval:
         os.makedirs(args.log_dir, exist_ok=True)
         log_writer = SummaryWriter(log_dir=args.log_dir)
@@ -176,15 +196,25 @@ def main(args):
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=True,
+        persistent_workers=True,
     )
+    data_loader_train_sampler = data_loader_train.sampler
+    if misc.XLA_CFG["is_xla"]:
+        data_loader_train = pl.MpDeviceLoader(data_loader_train, device)
+
+
 
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val, sampler=sampler_val,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
-        drop_last=False
+        drop_last=args.dist_eval, # True if distributed
+        persistent_workers=True,
     )
+    data_loader_val_sampler = data_loader_val.sampler
+    #if misc.XLA_CFG["is_xla"]:
+    #    data_loader_val = pl.MpDeviceLoader(data_loader_val, device)
 
     model = models_vit.__dict__[args.model](
         num_classes=args.nb_classes,
@@ -208,6 +238,7 @@ def main(args):
         # load pre-trained model
         msg = model.load_state_dict(checkpoint_model, strict=False)
         print(msg)
+        assert False
 
         if args.global_pool:
             assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
@@ -245,7 +276,9 @@ def main(args):
     print("accumulate grad iterations: %d" % args.accum_iter)
     print("effective batch size: %d" % eff_batch_size)
 
-    if args.distributed:
+    if misc.XLA_CFG["is_xla"]:
+        misc.broadcast_xla_master_model_param(model, args)
+    elif args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
 
@@ -269,7 +302,7 @@ def main(args):
     max_accuracy = 0.0
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
+            data_loader_train_sampler.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
@@ -307,10 +340,19 @@ def main(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
 
+def xla_main(index, args):
+    misc.XLA_CFG["is_xla"] = True
+    main(args)
+    
 
 if __name__ == '__main__':
     args = get_args_parser()
     args = args.parse_args()
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    main(args)
+    if args.use_xla:
+        # a TPUv3 device contains 4 chips and 8 cores in total
+        tpu_cores_per_node = 8
+        xmp.spawn(xla_main, args=(args,), nprocs=tpu_cores_per_node)
+    else:
+        main(args)

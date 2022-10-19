@@ -21,6 +21,14 @@ from timm.utils import accuracy
 import util.misc as misc
 import util.lr_sched as lr_sched
 
+try:
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.xla_multiprocessing as xmp
+    import torch_xla.distributed.parallel_loader as pl
+    import torch_xla.utils.utils as xu
+except ImportError:
+    xm = xmp = pl = xu = None
+
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -46,32 +54,50 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
-        samples = samples.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
+        if not misc.XLA_CFG["is_xla"]:
+            samples = samples.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
-        if mixup_fn is not None:
-            samples, targets = mixup_fn(samples, targets)
+            if mixup_fn is not None:
+                samples, targets = mixup_fn(samples, targets)
 
-        with torch.cuda.amp.autocast():
+            with torch.cuda.amp.autocast(enabled=not misc.XLA_CFG["is_xla"]):
+                outputs = model(samples)
+                loss = criterion(outputs, targets)
+
+            loss_value = loss.item()
+
+            if not math.isfinite(loss_value):
+                print("Loss is {}, stopping training".format(loss_value))
+                sys.exit(1)
+
+            loss /= accum_iter
+            loss_scaler(loss, optimizer, clip_grad=max_norm,
+                        parameters=model.parameters(), create_graph=False,
+                        update_grad=(data_iter_step + 1) % accum_iter == 0)
+        else:
+            if mixup_fn is not None:
+                samples, targets = mixup_fn(samples, targets)
             outputs = model(samples)
             loss = criterion(outputs, targets)
-
-        loss_value = loss.item()
-
-        if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
-            sys.exit(1)
-
-        loss /= accum_iter
-        loss_scaler(loss, optimizer, clip_grad=max_norm,
-                    parameters=model.parameters(), create_graph=False,
-                    update_grad=(data_iter_step + 1) % accum_iter == 0)
+            (loss / accum_iter).backward()
+            if (data_iter_step + 1) % accum_iter == 0:
+                xm.reduce_gradients(optimizer)
+                optimizer.step()
+            
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()
+        
+        if not misc.XLA_CFG["is_xla"]:
+            torch.cuda.synchronize()
+            metric_logger.update(loss=loss_value)
+        else:
+            # TODO(ronghanghu) figure out a better way for logging in XLA
+            # In XLA, it's too expensive to log every iteration due to the overhead
+            # of moving the loss scalar from TPU to host. 
+            if (data_iter_step - 1) % misc.XLA_CFG["logging_interval"] == 0:
+                xm.add_step_closure(_xla_logging, args=(metric_logger, loss))
 
-        torch.cuda.synchronize()
-
-        metric_logger.update(loss=loss_value)
         min_lr = 10.
         max_lr = 0.
         for group in optimizer.param_groups:
@@ -79,15 +105,17 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             max_lr = max(max_lr, group["lr"])
 
         metric_logger.update(lr=max_lr)
-
-        loss_value_reduce = misc.all_reduce_mean(loss_value)
-        if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
-            """ We use epoch_1000x as the x-axis in tensorboard.
-            This calibrates different curves when batch size changes.
-            """
-            epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
-            log_writer.add_scalar('loss', loss_value_reduce, epoch_1000x)
-            log_writer.add_scalar('lr', max_lr, epoch_1000x)
+        
+        if not misc.XLA_CFG["is_xla"]:
+            # TODO(ronghanghu): add tensorboard logging in XLA mode
+            loss_value_reduce = misc.all_reduce_mean(loss_value)
+            if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
+                """ We use epoch_1000x as the x-axis in tensorboard.
+                This calibrates different curves when batch size changes.
+                """
+                epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
+                log_writer.add_scalar('loss', loss_value_reduce, epoch_1000x)
+                log_writer.add_scalar('lr', max_lr, epoch_1000x)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -95,7 +123,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
+def _xla_logging(metric_logger, loss):
+    metric_logger.update(loss=loss.item())
+
 @torch.no_grad()
+# TODO: ADD evaluate TPU code
 def evaluate(data_loader, model, device):
     criterion = torch.nn.CrossEntropyLoss()
 
@@ -106,16 +138,24 @@ def evaluate(data_loader, model, device):
     model.eval()
 
     for batch in metric_logger.log_every(data_loader, 10, header):
-        images = batch[0]
-        target = batch[-1]
-        images = images.to(device, non_blocking=True)
-        target = target.to(device, non_blocking=True)
+        if not misc.XLA_CFG["is_xla"]:
+            images = batch[0]
+            target = batch[-1]
+            images = images.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
 
-        # compute output
-        with torch.cuda.amp.autocast():
+            # compute output
+            with torch.cuda.amp.autocast(enabled=not misc.XLA_CFG["is_xla"]):
+                output = model(images)
+                loss = criterion(output, target)
+        else:
+            images = batch[0]
+            target = batch[-1]
             output = model(images)
             loss = criterion(output, target)
 
+        if not misc.XLA_CFG["is_xla"]:
+            torch.cuda.synchronize()
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
         batch_size = images.shape[0]
